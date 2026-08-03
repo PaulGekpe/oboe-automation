@@ -1,0 +1,66 @@
+name: Daily Oboe Lesson
+
+on:
+  repository_dispatch:
+    types: [oboe-daily-lesson]
+  workflow_dispatch:
+    inputs:
+      topic:
+        description: 'Topic to test with (manual run)'
+        required: false
+        default: 'basics of negotiation'
+      calibrationAnswer:
+        description: 'Calibration answer to test with'
+        required: false
+        default: "I'm a busy professional, keep it practical."
+
+jobs:
+  run-lesson:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: ./playwright
+        run: npm ci
+
+      - name: Install Playwright browsers
+        working-directory: ./playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Oboe lesson bot
+        working-directory: ./playwright
+        env:
+          OBOE_STORAGE_STATE_B64: ${{ secrets.OBOE_STORAGE_STATE_B64 }}
+          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic }}
+          CALIBRATION_ANSWER: ${{ github.event.client_payload.calibrationAnswer || github.event.inputs.calibrationAnswer }}
+        run: node run-lesson.js
+
+      - name: Upload run artifacts (screenshots/logs) for verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oboe-run-${{ github.run_id }}
+          path: playwright/run-output/
+          retention-days: 14
+
+      - name: Alert on failure
+        if: failure()
+        env:
+          WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          ERROR_TEXT=$(tail -c 500 playwright/run-output/run-log.txt 2>/dev/null || echo "No run-log.txt was produced — likely failed before the bot started.")
+          curl -s -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$(node -e '
+              const [secret, topic, runUrl, errorText, date] = process.argv.slice(1);
+              console.log(JSON.stringify({ secret, topic, runUrl, errorMessage: errorText, date }));
+            ' "$WEBHOOK_SECRET" "$TOPIC" "$RUN_URL" "$ERROR_TEXT" "$(date -u +%Y-%m-%d)")"
