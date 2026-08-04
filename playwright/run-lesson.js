@@ -43,6 +43,18 @@ async function screenshot(page, name) {
   await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true });
 }
 
+// Polls until Oboe's "Thinking..." indicator disappears (or maxMs elapses).
+// Much more reliable than a fixed wait, since lesson-generation time varies.
+async function waitForOboeToFinishThinking(page, maxMs = 90000) {
+  const start = Date.now();
+  while (Date.now() - start < maxMs) {
+    const thinking = await page.locator('text=Thinking...').first().isVisible().catch(() => false);
+    if (!thinking) return true;
+    await page.waitForTimeout(1500);
+  }
+  return false; // gave up waiting — caller should proceed cautiously
+}
+
 async function run() {
   const stateJson = Buffer.from(STORAGE_STATE_B64, 'base64').toString('utf-8');
   const storageStatePath = path.join(OUT_DIR, 'storageState.json');
@@ -85,7 +97,11 @@ async function run() {
     await page.keyboard.press('Enter');
 
     record('Waiting for the lesson to build (this can take a bit)...');
-    await page.waitForTimeout(15000);
+    await page.waitForTimeout(2000); // brief pause for "Thinking..." to actually appear first
+    const finished = await waitForOboeToFinishThinking(page);
+    if (!finished) {
+      record('Still thinking after 90s — proceeding anyway, study guide step may not find the input box yet.');
+    }
     await screenshot(page, '04-lesson-built');
 
     record('Requesting a study guide artifact...');
