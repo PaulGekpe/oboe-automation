@@ -1,19 +1,12 @@
 /**
- * OBOE DAILY LESSON — BRAIN (free version, no paid API required)
+ * OBOE DAILY LESSON — BRAIN
  * ---------------------------------------------------------
- * Runs once a day on a trigger. Picks the next topic from a curated
- * list below (no AI call, no cost), then dispatches a
- * "repository_dispatch" event to GitHub Actions, which runs the
- * actual browser bot that logs into Oboe and completes the lesson.
- *
- * Anthropic's API requires prepaid credits (a card on file) to run,
- * so this version skips it entirely and just rotates through a
- * hand-written list instead — completely free. If you ever want
- * freshly AI-written topics instead, see the commented-out
- * `generateTopicWithAI_` function near the bottom: it's a drop-in
- * replacement for `pickNextTopic_`, and at these volumes (one short
- * call a day) it would cost a fraction of a cent per month once
- * you're comfortable adding a card.
+ * Runs once a day on a trigger. Picks 2 topics from the curated list
+ * below, dispatches them together to GitHub Actions (which runs the
+ * browser bot — now with Claude Haiku answering real questions, since
+ * you've added API billing), and later receives a webhook back with
+ * either a failure alert or a daily "what you learned" summary, both
+ * emailed to you via MailApp.
  *
  * SETUP (one time):
  * 1. Extensions > Apps Script > Project Settings > Script Properties.
@@ -22,16 +15,29 @@
  *                          "Contents: read" + "Actions: read/write"
  *                          scoped to your automation repo only)
  *      GITHUB_REPO     - "your-username/oboe-automation"
- *      ALERT_EMAIL      - the email address you want failure alerts sent to
+ *      ALERT_EMAIL      - the email address you want alerts/summaries sent to
  *      WEBHOOK_SECRET    - any random string you make up (also goes in a
  *                          GitHub secret) — stops strangers from spamming
- *                          your alert email via the public web app URL
+ *                          your inbox via the public web app URL
  * 2. Run `createDailyTrigger` once from the Apps Script editor to schedule it.
- * 3. Run `generateAndDispatchTopic` manually once to test end-to-end.
+ * 3. Run `generateAndDispatchTopics` manually once to test end-to-end.
  * 4. Deploy > New deployment > type "Web app" > Execute as: Me > Who has
  *    access: Anyone. Copy the deployment URL — you'll put it in a GitHub
- *    secret (see README) so GitHub Actions can call it on failure.
+ *    secret (see README) so GitHub Actions can call it back.
  */
+
+const TOPICS_PER_DAY = 2;
+
+// ---- These run first, in order, before the regular rotation kicks in.
+// With TOPICS_PER_DAY = 2, this fills days 1-2 completely and spills one
+// topic into day 3, after which TOPIC_LIST takes over as normal.
+const PRIORITY_TOPICS = [
+  { topic: 'effective communication skills', calibrationAnswer: "I'm a political candidate and community leader, keep it practical." },
+  { topic: 'negotiation strategies', calibrationAnswer: "I'm an elected-office candidate who negotiates with party stakeholders regularly." },
+  { topic: 'navigating office politics', calibrationAnswer: "I lead teams and manage stakeholder relationships, keep it practical." },
+  { topic: 'networking and relationship building', calibrationAnswer: "I'm building political and professional relationships, keep it practical." },
+  { topic: 'interpersonal and people skills', calibrationAnswer: "I lead a team and community, keep it practical." }
+];
 
 // ---- EDIT THIS: add, remove, or reorder topics freely ----
 const TOPIC_LIST = [
@@ -67,13 +73,10 @@ const TOPIC_LIST = [
   { topic: 'basics of monthly passive income strategies', calibrationAnswer: "I'm a beginner investor building a monthly dividend income strategy." }
 ];
 
-function generateAndDispatchTopic() {
+function generateAndDispatchTopics() {
   try {
-    generateAndDispatchTopic_();
+    generateAndDispatchTopics_();
   } catch (err) {
-    // If the "brain" itself fails (GitHub down, bad token, etc.) email
-    // directly rather than relying on the GitHub-side webhook, since we
-    // never made it to GitHub in this case.
     const alertEmail = PropertiesService.getScriptProperties().getProperty('ALERT_EMAIL');
     if (alertEmail) {
       MailApp.sendEmail(
@@ -82,11 +85,11 @@ function generateAndDispatchTopic() {
         `The Apps Script step failed before it could reach GitHub.\n\nError: ${err.message}\n\nCheck Apps Script > Executions for the full log.`
       );
     }
-    throw err; // still surface it in Apps Script's own execution log
+    throw err;
   }
 }
 
-function generateAndDispatchTopic_() {
+function generateAndDispatchTopics_() {
   const props = PropertiesService.getScriptProperties();
   const githubToken = props.getProperty('GITHUB_TOKEN');
   const githubRepo = props.getProperty('GITHUB_REPO');
@@ -95,52 +98,37 @@ function generateAndDispatchTopic_() {
     throw new Error('Missing script properties. Set GITHUB_TOKEN and GITHUB_REPO.');
   }
 
-  const parsed = pickNextTopic_();
+  const todaysTopics = pickNextTopics_(TOPICS_PER_DAY);
+  todaysTopics.forEach(t => saveTopicToLog(t.topic));
+  dispatchToGitHub(githubToken, githubRepo, todaysTopics);
 
-  saveTopicToLog(parsed.topic);
-  dispatchToGitHub(githubToken, githubRepo, parsed);
-
-  Logger.log('Dispatched topic: ' + parsed.topic);
+  Logger.log('Dispatched topics: ' + todaysTopics.map(t => t.topic).join(' | '));
 }
 
-// ---- picks the next un-used topic from TOPIC_LIST, cycling once the list is exhausted ----
-function pickNextTopic_() {
+// ---- picks N un-used topics: PRIORITY_TOPICS first (in order), then
+// TOPIC_LIST, cycling TOPIC_LIST once it's exhausted ----
+function pickNextTopics_(count) {
   const usedTopics = getAllLoggedTopics();
-  const next = TOPIC_LIST.find(t => usedTopics.indexOf(t.topic) === -1);
-  return next || TOPIC_LIST[usedTopics.length % TOPIC_LIST.length]; // cycle back around once all used
+  const unusedPriority = PRIORITY_TOPICS.filter(t => usedTopics.indexOf(t.topic) === -1);
+  const unusedRegular = TOPIC_LIST.filter(t => usedTopics.indexOf(t.topic) === -1);
+
+  const picked = unusedPriority.slice(0, count);
+  if (picked.length < count) {
+    picked.push(...unusedRegular.slice(0, count - picked.length));
+  }
+
+  // Safety net: if both lists are somehow exhausted, cycle back through TOPIC_LIST.
+  let i = 0;
+  while (picked.length < count) {
+    const candidate = TOPIC_LIST[i % TOPIC_LIST.length];
+    if (picked.indexOf(candidate) === -1) picked.push(candidate);
+    i++;
+    if (i > TOPIC_LIST.length * 2) break; // safety valve
+  }
+  return picked;
 }
 
-/*
-// ---- OPTIONAL UPGRADE: swap pickNextTopic_() for this once you're ready
-// to add a card at console.anthropic.com. Costs roughly a fraction of a
-// cent per call at this volume. Also add an ANTHROPIC_API_KEY script
-// property if you use this.
-function generateTopicWithAI_() {
-  const apiKey = PropertiesService.getScriptProperties().getProperty('ANTHROPIC_API_KEY');
-  const recentTopics = getAllLoggedTopics().slice(-14);
-  const prompt = `Pick one specific 5-10 minute learning topic for a Nigerian
-state assembly candidate and women's-political-representation advocate who
-is also a beginner dividend investor. Avoid repeating: ${JSON.stringify(recentTopics)}.
-Return ONLY JSON: {"topic": "...", "calibrationAnswer": "..."}`;
-
-  const response = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
-    method: 'post',
-    contentType: 'application/json',
-    headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-    payload: JSON.stringify({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 300,
-      messages: [{ role: 'user', content: prompt }]
-    }),
-    muteHttpExceptions: true
-  });
-  const body = JSON.parse(response.getContentText());
-  const raw = body.content[0].text.trim().replace(/^```json\s*|\s*```$/g, '');
-  return JSON.parse(raw);
-}
-*/
-
-function dispatchToGitHub(token, repo, parsed) {
+function dispatchToGitHub(token, repo, topics) {
   const url = `https://api.github.com/repos/${repo}/dispatches`;
   const response = UrlFetchApp.fetch(url, {
     method: 'post',
@@ -152,8 +140,7 @@ function dispatchToGitHub(token, repo, parsed) {
     payload: JSON.stringify({
       event_type: 'oboe-daily-lesson',
       client_payload: {
-        topic: parsed.topic,
-        calibrationAnswer: parsed.calibrationAnswer,
+        topics: topics, // array of {topic, calibrationAnswer}
         date: Utilities.formatDate(new Date(), 'GMT', 'yyyy-MM-dd')
       }
     }),
@@ -187,7 +174,8 @@ function getLogSheet() {
   return sheet;
 }
 
-// ---- receives failure pings from GitHub Actions and emails you ----
+// ---- receives pings from GitHub Actions: either a failure alert or a
+// daily summary of what was learned — both get emailed to you ----
 function doPost(e) {
   const props = PropertiesService.getScriptProperties();
   const expectedSecret = props.getProperty('WEBHOOK_SECRET');
@@ -201,16 +189,23 @@ function doPost(e) {
   }
 
   if (!expectedSecret || payload.secret !== expectedSecret) {
-    // Wrong/missing secret — silently ignore so this endpoint can't be
-    // used to spam your inbox or probe the system.
     return ContentService.createTextOutput('unauthorized').setMimeType(ContentService.MimeType.TEXT);
   }
 
+  if (payload.type === 'summary') {
+    sendSummaryEmail_(payload, alertEmail);
+  } else {
+    sendFailureEmail_(payload, alertEmail);
+  }
+
+  return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
+}
+
+function sendFailureEmail_(payload, alertEmail) {
   const subject = `⚠️ Oboe daily lesson failed (${payload.date || 'today'})`;
   const body = `
 The automated Oboe lesson run failed.
 
-Topic attempted: ${payload.topic || '(unknown)'}
 Error: ${payload.errorMessage || '(no details provided)'}
 Full run logs & screenshots: ${payload.runUrl || '(no link provided)'}
 
@@ -218,23 +213,36 @@ You'll need to check what went wrong — most commonly this is either an
 expired Oboe session (re-run save-session.js) or a UI change on Oboe's
 side (check the screenshot in the run's uploaded artifact).
 `;
+  if (alertEmail) MailApp.sendEmail(alertEmail, subject, body);
+}
 
-  if (alertEmail) {
-    MailApp.sendEmail(alertEmail, subject, body);
-  }
+function sendSummaryEmail_(payload, alertEmail) {
+  const topics = payload.topics || [];
+  const subject = `✅ Today's Oboe lessons (${payload.date || 'today'}) — ${topics.length} topic(s)`;
 
-  return ContentService.createTextOutput('ok').setMimeType(ContentService.MimeType.TEXT);
+  let body = `Here's what got covered today:\n\n`;
+  topics.forEach((t, i) => {
+    body += `${i + 1}. ${t.topic}\n`;
+    if (t.studyGuideText) {
+      body += `   Study guide highlights: ${t.studyGuideText.slice(0, 500)}${t.studyGuideText.length > 500 ? '...' : ''}\n`;
+    } else if (t.finalMessage) {
+      body += `   ${t.finalMessage.slice(0, 300)}${t.finalMessage.length > 300 ? '...' : ''}\n`;
+    }
+    body += `\n`;
+  });
+  body += `\nOpen Oboe to see the full lessons and check your Skills page for updates.`;
+
+  if (alertEmail) MailApp.sendEmail(alertEmail, subject, body);
 }
 
 // ---- run once to schedule the daily job ----
 function createDailyTrigger() {
-  // Clear any existing triggers for this function first to avoid duplicates
   ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === 'generateAndDispatchTopic') {
+    if (t.getHandlerFunction() === 'generateAndDispatchTopics') {
       ScriptApp.deleteTrigger(t);
     }
   });
-  ScriptApp.newTrigger('generateAndDispatchTopic')
+  ScriptApp.newTrigger('generateAndDispatchTopics')
     .timeBased()
     .everyDays(1)
     .atHour(6) // 6am in the script's timezone (set under Project Settings)

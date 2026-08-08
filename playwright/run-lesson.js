@@ -1,19 +1,17 @@
 /**
- * OBOE DAILY LESSON — HANDS
+ * OBOE DAILY LESSON — HANDS (AI-answer version)
  * ---------------------------------------------------------
- * Loads a saved logged-in session, opens Oboe, submits today's topic,
- * answers the calibration question, waits for the lesson to build,
- * and requests a study guide artifact. Takes screenshots at each step
- * into ./run-output/ so you can verify what happened (uploaded as a
- * GitHub Actions artifact by the workflow).
+ * Loads a saved logged-in session, then for each topic in TOPICS_JSON:
+ * submits it, answers the calibration question, waits for the lesson,
+ * engages with follow-up questions using Claude Haiku to pick genuine
+ * answers (falling back to random/generic if no API key is set), and
+ * requests a study guide artifact. Screenshots go to ./run-output/.
+ * At the end, posts a combined summary of all topics to the Apps Script
+ * webhook, which emails it to you.
  *
- * NOTE ON SELECTORS: I can't see Oboe's real DOM from here since it's
- * behind login. The selectors below are best-guesses based on Oboe's
- * own published UI guide (button/placeholder text). If a step fails,
- * open the screenshot in run-output/, then open Oboe yourself, right-
- * click the relevant element > Inspect, and update the matching
- * SELECTORS entry below. This is the one part of the pipeline that
- * will likely need a five-minute tune-up after your first real run.
+ * NOTE ON SELECTORS: best-guesses refined from a real captured Oboe
+ * page — see SELECTORS below. If Oboe changes their UI, screenshots in
+ * run-output/ will show exactly where a step broke.
  */
 const fs = require('fs');
 const path = require('path');
@@ -22,29 +20,48 @@ const { chromium } = require('playwright');
 const OUT_DIR = path.join(__dirname, 'run-output');
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR);
 
-const TOPIC = process.env.TOPIC;
-const CALIBRATION_ANSWER = process.env.CALIBRATION_ANSWER;
 const STORAGE_STATE_B64 = process.env.OBOE_STORAGE_STATE_B64;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY; // optional — falls back to free behavior if unset
+const WEBHOOK_URL = process.env.APPS_SCRIPT_WEBHOOK_URL;
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
 
-if (!TOPIC || !STORAGE_STATE_B64) {
-  console.error('Missing TOPIC or OBOE_STORAGE_STATE_B64 env vars.');
+// TOPICS_JSON looks like: [{"topic":"...", "calibrationAnswer":"..."}, {...}]
+let TOPICS;
+try {
+  TOPICS = JSON.parse(process.env.TOPICS_JSON || '[]');
+} catch (e) {
+  TOPICS = [];
+}
+
+if (!STORAGE_STATE_B64 || TOPICS.length === 0) {
+  console.error('Missing OBOE_STORAGE_STATE_B64 or TOPICS_JSON env vars.');
   process.exit(1);
 }
 
-// Edit these if Oboe's real markup differs from these guesses.
+// Edit these if Oboe's real markup differs. name="prompt" and the send
+// button's aria-label were confirmed from a real captured page.
 const SELECTORS = {
-  learnBox: 'textarea, input[type="text"]', // the "I want to learn..." box on the home screen
-  sendButton: 'button[type="submit"], button:has-text("Send")',
-  calibrationInput: 'textarea, input[type="text"]', // reused after the first message
-  askQuestionBox: 'textarea[placeholder*="Ask a question" i]'
+  promptBox: 'textarea[name="prompt"]',
+  sendButton: 'button[type="submit"][aria-label="Send message"]',
+  // Multiple-choice / suggested-reply chips (confirmed class from a real
+  // captured lesson: buttons with a "followUpRow" class, each containing a
+  // lettered icon span and a text <p>).
+  suggestedReplyChip: '.followUpRow'
 };
+
+const GENERIC_ENGAGED_REPLIES = [
+  'That makes sense — can you give me a real-world example?',
+  "Got it. What's the most common mistake people make here?",
+  'Interesting, how would this apply in my specific situation?',
+  'Can you summarize the key takeaway so far?',
+  'What should I focus on practicing first?',
+  'Yes, that helps — please go a bit deeper on that point.'
+];
 
 async function screenshot(page, name) {
   await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true });
 }
 
-// Polls until Oboe's "Thinking..." indicator disappears (or maxMs elapses).
-// Much more reliable than a fixed wait, since lesson-generation time varies.
 async function waitForOboeToFinishThinking(page, maxMs = 90000) {
   const start = Date.now();
   while (Date.now() - start < maxMs) {
@@ -52,7 +69,173 @@ async function waitForOboeToFinishThinking(page, maxMs = 90000) {
     if (!thinking) return true;
     await page.waitForTimeout(1500);
   }
-  return false; // gave up waiting — caller should proceed cautiously
+  return false;
+}
+
+async function findSuggestionChips(page) {
+  const chips = await page.locator(SELECTORS.suggestedReplyChip).all();
+  const visible = [];
+  for (const chip of chips) {
+    if (await chip.isVisible().catch(() => false)) visible.push(chip);
+  }
+  return visible;
+}
+
+// Grabs the text of the last visible assistant message, for AI context and
+// for the end-of-day summary. Best-effort: falls back to empty string.
+async function getLastMessageText(page) {
+  try {
+    // Everything above the input area, take the last reasonably-sized text block.
+    const blocks = await page.locator('p, div').allInnerTexts();
+    const candidates = blocks.filter(t => t && t.trim().length > 40);
+    return candidates.length ? candidates[candidates.length - 1].trim() : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Calls Claude Haiku to either pick the best chip index or write a genuine
+// short reply. Returns { chipIndex } or { replyText }. Falls back to null
+// (caller should use free/random behavior) if no API key or on any error.
+async function askClaudeForAnswer(lastMessageText, chipTexts) {
+  if (!ANTHROPIC_API_KEY) return null;
+  try {
+    const prompt = chipTexts.length > 0
+      ? `Oboe (a learning app) just said:\n"""${lastMessageText}"""\n\nIt's offering these reply options:\n${chipTexts.map((t, i) => `${i}: ${t}`).join('\n')}\n\nAs the learner, which option number is the most sensible, genuinely engaged choice? Reply with ONLY the number, nothing else.`
+      : `Oboe (a learning app) just said:\n"""${lastMessageText}"""\n\nAs the learner, write a short (1-2 sentence), genuinely engaged reply or answer to keep the lesson moving. Reply with ONLY the reply text, nothing else.`;
+
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+    const data = await response.json();
+    const text = data?.content?.[0]?.text?.trim();
+    if (!text) return null;
+
+    if (chipTexts.length > 0) {
+      const idx = parseInt(text.match(/\d+/)?.[0], 10);
+      return Number.isInteger(idx) && idx >= 0 && idx < chipTexts.length ? { chipIndex: idx } : null;
+    }
+    return { replyText: text };
+  } catch (e) {
+    return null; // fall back to free behavior
+  }
+}
+
+async function engageWithFollowUps(page, record, topicLabel, maxRounds = 5) {
+  for (let round = 1; round <= maxRounds; round++) {
+    await waitForOboeToFinishThinking(page);
+    const chips = await findSuggestionChips(page);
+    const lastMessage = await getLastMessageText(page);
+
+    if (chips.length > 0) {
+      const chipTexts = [];
+      for (const chip of chips) chipTexts.push((await chip.innerText()).trim());
+
+      const aiChoice = await askClaudeForAnswer(lastMessage, chipTexts);
+      const chosenIndex = aiChoice?.chipIndex ?? Math.floor(Math.random() * chips.length);
+      const source = aiChoice ? 'AI-selected' : 'randomly picked (no AI / AI unavailable)';
+      record(`Round ${round}: ${source} — "${chipTexts[chosenIndex]}"`);
+      await chips[chosenIndex].click().catch(() => record(`Round ${round}: chip click failed, skipping.`));
+    } else {
+      const askBox = page.locator(SELECTORS.promptBox).first();
+      if (!(await askBox.isVisible().catch(() => false))) {
+        record(`Round ${round}: no chips or input box — assuming lesson is done.`);
+        break;
+      }
+      const aiChoice = await askClaudeForAnswer(lastMessage, []);
+      const reply = aiChoice?.replyText || GENERIC_ENGAGED_REPLIES[Math.floor(Math.random() * GENERIC_ENGAGED_REPLIES.length)];
+      const source = aiChoice ? 'AI-written' : 'generic (no AI / AI unavailable)';
+      record(`Round ${round}: ${source} reply — "${reply}"`);
+      await askBox.click();
+      await askBox.fill(reply);
+      await page.keyboard.press('Enter');
+    }
+
+    await page.waitForTimeout(1500);
+    await waitForOboeToFinishThinking(page);
+    await screenshot(page, `${topicLabel}-engagement-round-${round}`);
+  }
+}
+
+async function runOneTopic(page, record, topicIndex, topicObj) {
+  const label = `topic${topicIndex + 1}`;
+  const { topic, calibrationAnswer } = topicObj;
+
+  record(`[${label}] Typing topic: "${topic}"`);
+  const promptBox = page.locator(SELECTORS.promptBox).first();
+  await promptBox.click();
+  await promptBox.fill(topic);
+  await page.keyboard.press('Enter');
+  await screenshot(page, `${label}-01-submitted`);
+
+  record(`[${label}] Waiting for calibration question...`);
+  await page.waitForTimeout(3000);
+  await screenshot(page, `${label}-02-calibration`);
+
+  record(`[${label}] Answering calibration: "${calibrationAnswer}"`);
+  const calibrationInput = page.locator(SELECTORS.promptBox).first();
+  await calibrationInput.click();
+  await calibrationInput.fill(calibrationAnswer || "I'm a busy professional, keep it practical and concise.");
+  await page.keyboard.press('Enter');
+
+  record(`[${label}] Waiting for the lesson to build...`);
+  await page.waitForTimeout(2000);
+  await waitForOboeToFinishThinking(page);
+  await screenshot(page, `${label}-03-built`);
+
+  record(`[${label}] Engaging with follow-up questions...`);
+  await engageWithFollowUps(page, record, label);
+
+  const finalMessage = await getLastMessageText(page);
+
+  record(`[${label}] Requesting a study guide artifact...`);
+  const askBox = page.locator(SELECTORS.promptBox).first();
+  let studyGuideText = '';
+  if (await askBox.isVisible().catch(() => false)) {
+    await askBox.click();
+    await askBox.fill('/studyguide');
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(3000);
+    await waitForOboeToFinishThinking(page);
+    studyGuideText = await getLastMessageText(page);
+    await screenshot(page, `${label}-99-studyguide`);
+  } else {
+    record(`[${label}] Ask box not found — skipping study guide step.`);
+  }
+
+  return { topic, finalMessage, studyGuideText };
+}
+
+async function postSummaryToWebhook(summaries, record) {
+  if (!WEBHOOK_URL || !WEBHOOK_SECRET) {
+    record('No webhook configured — skipping summary email.');
+    return;
+  }
+  try {
+    await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        secret: WEBHOOK_SECRET,
+        type: 'summary',
+        date: new Date().toISOString().slice(0, 10),
+        topics: summaries
+      })
+    });
+    record('Posted daily summary to webhook.');
+  } catch (e) {
+    record('Failed to post summary webhook: ' + e.message);
+  }
 }
 
 async function run() {
@@ -66,60 +249,34 @@ async function run() {
 
   const log = [];
   const record = msg => { console.log(msg); log.push(`${new Date().toISOString()} ${msg}`); };
+  const summaries = [];
 
   try {
-    record(`Opening Oboe home...`);
+    record('Opening Oboe home...');
     await page.goto('https://oboe.com/', { waitUntil: 'networkidle' });
-    await screenshot(page, '01-home');
+    await screenshot(page, '00-home');
 
-    // Sanity check: are we actually logged in? Look for something that only
-    // appears when authenticated (e.g. absence of a "Log in" button).
     const loggedOut = await page.locator('text=Log in').first().isVisible().catch(() => false);
     if (loggedOut) {
       throw new Error('Session appears expired — "Log in" is visible. Re-run save-session.js and update the GitHub secret.');
     }
 
-    record(`Typing topic: "${TOPIC}"`);
-    const learnBox = page.locator(SELECTORS.learnBox).first();
-    await learnBox.click();
-    await learnBox.fill(TOPIC);
-    await page.keyboard.press('Enter');
-    await screenshot(page, '02-topic-submitted');
-
-    record('Waiting for calibration question...');
-    await page.waitForTimeout(3000); // give the chat time to respond
-    await screenshot(page, '03-calibration-question');
-
-    record(`Answering calibration: "${CALIBRATION_ANSWER}"`);
-    const calibrationInput = page.locator(SELECTORS.calibrationInput).first();
-    await calibrationInput.click();
-    await calibrationInput.fill(CALIBRATION_ANSWER || "I'm a busy professional, keep it practical and concise.");
-    await page.keyboard.press('Enter');
-
-    record('Waiting for the lesson to build (this can take a bit)...');
-    await page.waitForTimeout(2000); // brief pause for "Thinking..." to actually appear first
-    const finished = await waitForOboeToFinishThinking(page);
-    if (!finished) {
-      record('Still thinking after 90s — proceeding anyway, study guide step may not find the input box yet.');
-    }
-    await screenshot(page, '04-lesson-built');
-
-    record('Requesting a study guide artifact...');
-    const askBox = page.locator(SELECTORS.askQuestionBox).first();
-    if (await askBox.isVisible().catch(() => false)) {
-      await askBox.click();
-      await askBox.fill('/studyguide');
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(8000);
-      await screenshot(page, '05-studyguide');
-    } else {
-      record('Ask-question box not found — skipping study guide step (selector may need updating).');
+    for (let i = 0; i < TOPICS.length; i++) {
+      // Start a fresh chat for each topic after the first (click the "+" new-chat control).
+      if (i > 0) {
+        await page.goto('https://oboe.com/', { waitUntil: 'networkidle' });
+        await page.waitForTimeout(1000);
+      }
+      const result = await runOneTopic(page, record, i, TOPICS[i]);
+      summaries.push(result);
     }
 
-    record('Done. Lesson should now be saved in your Oboe chat history.');
+    await postSummaryToWebhook(summaries, record);
+    record('Done with all topics for today.');
   } catch (err) {
     record('ERROR: ' + err.message);
     await screenshot(page, '99-error-state');
+    if (summaries.length > 0) await postSummaryToWebhook(summaries, record); // send partial summary if any topics finished
     fs.writeFileSync(path.join(OUT_DIR, 'run-log.txt'), log.join('\n'));
     await browser.close();
     process.exit(1);

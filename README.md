@@ -1,16 +1,21 @@
 # Oboe Daily Lesson Bot
 
-Fully automated daily learning: an AI picks today's topic based on your
-goals, a browser bot logs into Oboe and runs the lesson for you, and
-you get an email if any run fails. No clicking required once it's set up.
+Fully automated daily learning: 2 topics a day, a browser bot that logs
+into Oboe and actually reads Oboe's questions to pick genuine answers
+(via Claude Haiku), a daily "what you learned" summary email, and a
+failure alert if any run breaks. No clicking required once it's set up.
 
 **Three moving parts:**
 - `apps-script/Code.gs` — the "brain." Runs daily in Google Apps Script,
-  asks an AI model for today's topic, pings GitHub Actions to go run it,
-  and emails you if anything fails.
+  picks 2 topics from a curated list, pings GitHub Actions to go run
+  them, and emails you either a failure alert or a summary of what was
+  covered, depending on what GitHub Actions reports back.
 - `playwright/` — the "hands." A headless-browser bot (runs on GitHub's
-  servers via Actions) that logs into Oboe and completes the lesson.
-- A small failure-alert loop: if the bot fails, GitHub Actions calls back
+  servers via Actions) that logs into Oboe, runs both lessons, and — for
+  each question or multiple-choice prompt Oboe shows — calls Claude
+  Haiku with the real on-screen text to pick a genuinely relevant
+  answer, rather than guessing randomly.
+- A small alert/summary loop: after each run, GitHub Actions calls back
   to your Apps Script (deployed as a tiny web app), which emails you via
   your own Gmail — no separate email service needed.
 
@@ -66,16 +71,16 @@ Base64-encode it and copy the result to your clipboard:
 ### 3. Deploy the Apps Script "brain" and get its web app URL
 - Go to script.google.com > New project. Paste in `apps-script/Code.gs`.
 - **Project Settings (gear icon) > Script Properties**, add:
-  - `ANTHROPIC_API_KEY` — from console.anthropic.com
   - `GITHUB_TOKEN` — a fine-grained GitHub Personal Access Token
     (github.com/settings/tokens, "Fine-grained tokens") scoped only to
     this repo, with **Contents: Read** and **Actions: Read and write**
   - `GITHUB_REPO` — e.g. `YOUR-USERNAME/oboe-automation`
-  - `ALERT_EMAIL` — the email address you want failure alerts sent to
+  - `ALERT_EMAIL` — the email address you want alerts/summaries sent to
   - `WEBHOOK_SECRET` — make up any random string, e.g. a UUID; you'll
     reuse this exact value in a GitHub secret in step 4
-- Edit the `LEARNER_CONTEXT` block near the top of `Code.gs` if you want
-  to steer the kinds of topics it picks.
+- Topics come from the hand-written `TOPIC_LIST` near the top of
+  `Code.gs` — edit that list to add, remove, or reorder topics.
+  `TOPICS_PER_DAY` (default `2`) controls how many are picked each run.
 - **Deploy > New deployment > type "Web app"** — set "Execute as: Me"
   and "Who has access: Anyone." Click Deploy, authorize the requested
   permissions, and copy the **Web app URL** it gives you (looks like
@@ -88,26 +93,38 @@ In your repo: **Settings > Secrets and variables > Actions > New repository secr
 - `OBOE_STORAGE_STATE_B64` — the base64 string from step 2
 - `APPS_SCRIPT_WEBHOOK_URL` — the web app URL from step 3
 - `WEBHOOK_SECRET` — the exact same random string you put in Apps Script's `WEBHOOK_SECRET` property
+- `ANTHROPIC_API_KEY` — the key you created at console.anthropic.com. Without
+  this secret the bot still works, it just falls back to random chip
+  picks and generic replies instead of AI-chosen answers — so it's worth
+  double-checking this one's set correctly.
 
 ### 5. Test the bot manually before automating it
-In your repo: **Actions tab > Daily Oboe Lesson > Run workflow**, fill in
-a test topic, run it. Check the uploaded `run-output` artifact
-(screenshots + log) to confirm each step worked.
+In your repo: **Actions tab > Daily Oboe Lesson > Run workflow**. The
+default `topicsJson` input already has one test topic filled in — leave
+it, or edit it to a JSON array like:
+```json
+[{"topic":"basics of negotiation","calibrationAnswer":"I am a busy professional, keep it practical."},{"topic":"basics of dividend investing","calibrationAnswer":"I am a beginner investor."}]
+```
+Run it, then check the uploaded `run-output` artifact (screenshots +
+log) to confirm each step worked — including whether the log shows
+"AI-selected" / "AI-written" (means `ANTHROPIC_API_KEY` is working) or
+"randomly picked" / "generic" (means it silently fell back — check the
+secret's spelled and pasted correctly).
 
-Oboe's real page structure may differ slightly from the guessed
-selectors in `playwright/run-lesson.js` — if a step fails, the error
-screenshot will show you exactly where, and the `SELECTORS` object near
-the top of that file is where to fix it (on oboe.com, right-click the
-relevant box > Inspect > copy a stable selector like an `id` or
-`data-testid` if one exists).
+Oboe's real page structure may differ slightly from the selectors in
+`playwright/run-lesson.js` — if a step fails, the error screenshot will
+show you exactly where, and the `SELECTORS` object near the top of that
+file is where to fix it (on oboe.com, right-click the relevant box >
+Inspect > copy a stable selector like a class name or `data-testid`).
 
 **Also test the alert path on purpose once:** temporarily break something
 (e.g. set `OBOE_STORAGE_STATE_B64` to garbage) and re-run the workflow.
 You should get a failure email within a minute or two. Then put the real
-value back.
+value back. A successful run should also land you a summary email once
+it finishes both topics.
 
 ### 6. Wire up the daily schedule
-Back in the Apps Script editor, run `generateAndDispatchTopic` once
+Back in the Apps Script editor, run `generateAndDispatchTopics` once
 manually (▶ button, pick that function) to test the full chain
 end-to-end — check Apps Script's **Executions** log, then your repo's
 **Actions** tab. Once that works, run `createDailyTrigger` once to

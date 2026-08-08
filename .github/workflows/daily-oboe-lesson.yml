@@ -5,19 +5,15 @@ on:
     types: [oboe-daily-lesson]
   workflow_dispatch:
     inputs:
-      topic:
-        description: 'Topic to test with (manual run)'
+      topicsJson:
+        description: 'JSON array of {topic, calibrationAnswer} to test with'
         required: false
-        default: 'basics of negotiation'
-      calibrationAnswer:
-        description: 'Calibration answer to test with'
-        required: false
-        default: "I'm a busy professional, keep it practical."
+        default: '[{"topic":"basics of negotiation","calibrationAnswer":"I am a busy professional, keep it practical."}]'
 
 jobs:
   run-lesson:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -37,8 +33,10 @@ jobs:
         working-directory: ./playwright
         env:
           OBOE_STORAGE_STATE_B64: ${{ secrets.OBOE_STORAGE_STATE_B64 }}
-          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic }}
-          CALIBRATION_ANSWER: ${{ github.event.client_payload.calibrationAnswer || github.event.inputs.calibrationAnswer }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APPS_SCRIPT_WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
+          TOPICS_JSON: ${{ github.event.client_payload.topics && toJSON(github.event.client_payload.topics) || github.event.inputs.topicsJson }}
         run: node run-lesson.js
 
       - name: Upload run artifacts (screenshots/logs) for verification
@@ -54,13 +52,12 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
-          TOPIC: ${{ github.event.client_payload.topic || github.event.inputs.topic }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          ERROR_TEXT=$(tail -c 500 playwright/run-output/run-log.txt 2>/dev/null || echo "No run-log.txt was produced — likely failed before the bot started.")
+          ERROR_TEXT=$(tail -c 800 playwright/run-output/run-log.txt 2>/dev/null || echo "No run-log.txt was produced — likely failed before the bot started.")
           curl -s -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "$(node -e '
-              const [secret, topic, runUrl, errorText, date] = process.argv.slice(1);
-              console.log(JSON.stringify({ secret, topic, runUrl, errorMessage: errorText, date }));
-            ' "$WEBHOOK_SECRET" "$TOPIC" "$RUN_URL" "$ERROR_TEXT" "$(date -u +%Y-%m-%d)")"
+              const [secret, runUrl, errorText, date] = process.argv.slice(1);
+              console.log(JSON.stringify({ secret, type: "failure", runUrl, errorMessage: errorText, date }));
+            ' "$WEBHOOK_SECRET" "$RUN_URL" "$ERROR_TEXT" "$(date -u +%Y-%m-%d)")"
