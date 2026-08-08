@@ -43,10 +43,16 @@ if (!STORAGE_STATE_B64 || TOPICS.length === 0) {
 const SELECTORS = {
   promptBox: 'textarea[name="prompt"]',
   sendButton: 'button[type="submit"][aria-label="Send message"]',
-  // Multiple-choice / suggested-reply chips (confirmed class from a real
-  // captured lesson: buttons with a "followUpRow" class, each containing a
-  // lettered icon span and a text <p>).
-  suggestedReplyChip: '.followUpRow'
+  // Multiple-choice / suggested-reply chips. `.followUpRow` was confirmed
+  // from a real captured lettered quiz (A/B/C/D style). Broadened with a
+  // partial-class match too, since Oboe appears to have at least one other
+  // suggestion style (plain "Continue to..." / "Tell me more..." rows) that
+  // may use different markup — unconfirmed, may need a real capture to nail
+  // down precisely.
+  suggestedReplyChip: '.followUpRow, [class*="followUpRow"], [class*="suggestionRow"], [class*="nextStepRow"]',
+  // The step-by-step "Your path" checklist shown for structured lessons.
+  pathContainer: 'text=Your path',
+  currentStepLabel: 'text=CURRENT STEP'
 };
 
 const GENERIC_ENGAGED_REPLIES = [
@@ -83,15 +89,33 @@ async function findSuggestionChips(page) {
 
 // Grabs the text of the last visible assistant message, for AI context and
 // for the end-of-day summary. Best-effort: falls back to empty string.
+// Filters out obvious non-message UI labels that were showing up as false
+// context (e.g. artifact panel titles, step badges).
 async function getLastMessageText(page) {
   try {
-    // Everything above the input area, take the last reasonably-sized text block.
+    const NOISE = /^(guide|current step|next step|your path|share|upgrade)$/i;
     const blocks = await page.locator('p, div').allInnerTexts();
-    const candidates = blocks.filter(t => t && t.trim().length > 40);
-    return candidates.length ? candidates[candidates.length - 1].trim() : '';
+    const candidates = blocks
+      .map(t => (t || '').trim())
+      .filter(t => t.length > 40 && !NOISE.test(t))
+      // Skip blocks that are almost entirely a UI label repeated (heuristic:
+      // real prose has spaces between many words; labels tend to be short
+      // and title-cased without much punctuation).
+      .filter(t => t.split(' ').length > 6);
+    return candidates.length ? candidates[candidates.length - 1] : '';
   } catch (e) {
     return '';
   }
+}
+
+// If Oboe shows a structured "Your path" checklist, this returns whether
+// it looks complete (path exists, but no "CURRENT STEP" marker left).
+// Returns null if no path is present at all (topic isn't using that format).
+async function isStructuredPathComplete(page) {
+  const hasPath = await page.locator(SELECTORS.pathContainer).first().isVisible().catch(() => false);
+  if (!hasPath) return null;
+  const hasCurrentStep = await page.locator(SELECTORS.currentStepLabel).first().isVisible().catch(() => false);
+  return !hasCurrentStep;
 }
 
 // Calls Claude Haiku to either pick the best chip index or write a genuine
@@ -131,9 +155,25 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
   }
 }
 
-async function engageWithFollowUps(page, record, topicLabel, maxRounds = 5) {
+async function engageWithFollowUps(page, record, topicLabel, maxRounds = 20, maxMs = 300000) {
+  const start = Date.now();
   for (let round = 1; round <= maxRounds; round++) {
+    if (Date.now() - start > maxMs) {
+      record(`Round ${round}: hit the ${Math.round(maxMs / 60000)}-minute time budget for this topic — moving on.`);
+      break;
+    }
+
     await waitForOboeToFinishThinking(page);
+
+    // If Oboe shows a structured step-by-step path and it's no longer on a
+    // "current step," treat the lesson as genuinely finished rather than
+    // continuing to poke at it.
+    const pathComplete = await isStructuredPathComplete(page);
+    if (pathComplete === true) {
+      record(`Round ${round}: structured lesson path shows complete (no more "CURRENT STEP") — stopping here.`);
+      break;
+    }
+
     const chips = await findSuggestionChips(page);
     const lastMessage = await getLastMessageText(page);
 
