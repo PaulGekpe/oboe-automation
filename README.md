@@ -80,7 +80,8 @@ Base64-encode it and copy the result to your clipboard:
     reuse this exact value in a GitHub secret in step 4
 - Topics come from the hand-written `TOPIC_LIST` near the top of
   `Code.gs` — edit that list to add, remove, or reorder topics.
-  `TOPICS_PER_DAY` (default `2`) controls how many are picked each run.
+  **Recommended: 2 topics/day via two separate single-topic runs**
+  (morning + afternoon) rather than both in one job — see step 6.
 - **Deploy > New deployment > type "Web app"** — set "Execute as: Me"
   and "Who has access: Anyone." Click Deploy, authorize the requested
   permissions, and copy the **Web app URL** it gives you (looks like
@@ -101,10 +102,11 @@ In your repo: **Settings > Secrets and variables > Actions > New repository secr
 ### 5. Test the bot manually before automating it
 In your repo: **Actions tab > Daily Oboe Lesson > Run workflow**. The
 default `topicsJson` input already has one test topic filled in — leave
-it, or edit it to a JSON array like:
-```json
-[{"topic":"basics of negotiation","calibrationAnswer":"I am a busy professional, keep it practical."},{"topic":"basics of dividend investing","calibrationAnswer":"I am a beginner investor."}]
-```
+it as a single topic for testing (real lessons now run 15-30+
+interactive rounds, so testing with 2 topics at once will take a while
+and risks the 30-minute job timeout — that's exactly the problem the
+twice-daily setup in step 6 avoids).
+
 Run it, then check the uploaded `run-output` artifact (screenshots +
 log) to confirm each step worked — including whether the log shows
 "AI-selected" / "AI-written" (means `ANTHROPIC_API_KEY` is working) or
@@ -119,16 +121,20 @@ Inspect > copy a stable selector like a class name or `data-testid`).
 
 **Also test the alert path on purpose once:** temporarily break something
 (e.g. set `OBOE_STORAGE_STATE_B64` to garbage) and re-run the workflow.
-You should get a failure email within a minute or two. Then put the real
-value back. A successful run should also land you a summary email once
-it finishes both topics.
+You should get exactly one failure email within a minute or two. Then put
+the real value back. A successful run should land you exactly one ✅
+summary email once it finishes — never both from the same run.
 
-### 6. Wire up the daily schedule
-Back in the Apps Script editor, run `generateAndDispatchTopics` once
+### 6. Wire up the twice-daily schedule
+Back in the Apps Script editor, run `generateAndDispatchOneTopic` once
 manually (▶ button, pick that function) to test the full chain
 end-to-end — check Apps Script's **Executions** log, then your repo's
-**Actions** tab. Once that works, run `createDailyTrigger` once to
-schedule it to run automatically every day.
+**Actions** tab. Once that works, run `createTwiceDailyTriggers` once —
+this schedules two runs a day (8am and 2pm in your script's timezone),
+each picking and completing one topic. This replaces the older
+`createDailyTrigger` / `generateAndDispatchTopics` (two-topics-in-one-run)
+approach — `createTwiceDailyTriggers` clears any existing triggers
+first, so you don't need to manually remove the old one.
 
 ---
 

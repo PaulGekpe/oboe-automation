@@ -1,12 +1,17 @@
 /**
  * OBOE DAILY LESSON — BRAIN
  * ---------------------------------------------------------
- * Runs once a day on a trigger. Picks 2 topics from the curated list
- * below, dispatches them together to GitHub Actions (which runs the
- * browser bot — now with Claude Haiku answering real questions, since
- * you've added API billing), and later receives a webhook back with
- * either a failure alert or a daily "what you learned" summary, both
+ * Picks a topic from the curated list below and dispatches it to
+ * GitHub Actions (which runs the browser bot — with Claude Haiku
+ * answering real questions), and later receives a webhook back with
+ * either a failure alert or a "what you learned" summary, both
  * emailed to you via MailApp.
+ *
+ * RECOMMENDED: two topics/day via two separate single-topic runs
+ * (morning + afternoon) rather than both in one job — real lessons can
+ * run 15+ interactive rounds plus live web research, and two topics in
+ * a single 30-minute GitHub Actions job risk one getting cut off before
+ * Oboe's Skills tracking registers it as complete.
  *
  * SETUP (one time):
  * 1. Extensions > Apps Script > Project Settings > Script Properties.
@@ -19,8 +24,9 @@
  *      WEBHOOK_SECRET    - any random string you make up (also goes in a
  *                          GitHub secret) — stops strangers from spamming
  *                          your inbox via the public web app URL
- * 2. Run `createDailyTrigger` once from the Apps Script editor to schedule it.
- * 3. Run `generateAndDispatchTopics` manually once to test end-to-end.
+ * 2. Run `createTwiceDailyTriggers` once from the Apps Script editor to
+ *    schedule two single-topic runs a day (8am and 2pm).
+ * 3. Run `generateAndDispatchOneTopic` manually once to test end-to-end.
  * 4. Deploy > New deployment > type "Web app" > Execute as: Me > Who has
  *    access: Anyone. Copy the deployment URL — you'll put it in a GitHub
  *    secret (see README) so GitHub Actions can call it back.
@@ -103,6 +109,45 @@ function generateAndDispatchTopics_() {
   dispatchToGitHub(githubToken, githubRepo, todaysTopics);
 
   Logger.log('Dispatched topics: ' + todaysTopics.map(t => t.topic).join(' | '));
+}
+
+// ---- RECOMMENDED: dispatches ONE topic per call. Now that real lessons
+// can run 15+ interactive rounds plus live web research, two topics in a
+// single GitHub Actions job risk hitting its 30-minute limit — the
+// second topic (or even the tail end of the first) can get cut off
+// before Oboe's Skills tracking registers it as complete. Call this
+// twice a day instead (see createTwiceDailyTriggers below) so each
+// topic gets its own full run and full time budget.
+function generateAndDispatchOneTopic() {
+  try {
+    generateAndDispatchOneTopic_();
+  } catch (err) {
+    const alertEmail = PropertiesService.getScriptProperties().getProperty('ALERT_EMAIL');
+    if (alertEmail) {
+      MailApp.sendEmail(
+        alertEmail,
+        '⚠️ Oboe daily lesson: topic selection failed',
+        `The Apps Script step failed before it could reach GitHub.\n\nError: ${err.message}\n\nCheck Apps Script > Executions for the full log.`
+      );
+    }
+    throw err;
+  }
+}
+
+function generateAndDispatchOneTopic_() {
+  const props = PropertiesService.getScriptProperties();
+  const githubToken = props.getProperty('GITHUB_TOKEN');
+  const githubRepo = props.getProperty('GITHUB_REPO');
+
+  if (!githubToken || !githubRepo) {
+    throw new Error('Missing script properties. Set GITHUB_TOKEN and GITHUB_REPO.');
+  }
+
+  const todaysTopic = pickNextTopics_(1);
+  todaysTopic.forEach(t => saveTopicToLog(t.topic));
+  dispatchToGitHub(githubToken, githubRepo, todaysTopic);
+
+  Logger.log('Dispatched topic: ' + todaysTopic.map(t => t.topic).join(' | '));
 }
 
 // ---- picks N un-used topics: PRIORITY_TOPICS first (in order), then
@@ -235,7 +280,8 @@ function sendSummaryEmail_(payload, alertEmail) {
   if (alertEmail) MailApp.sendEmail(alertEmail, subject, body);
 }
 
-// ---- run once to schedule the daily job ----
+// ---- run once to schedule the OLD two-topics-in-one-run approach.
+// Kept for reference — createTwiceDailyTriggers below is now recommended instead.
 function createDailyTrigger() {
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === 'generateAndDispatchTopics') {
@@ -247,4 +293,29 @@ function createDailyTrigger() {
     .everyDays(1)
     .atHour(6) // 6am in the script's timezone (set under Project Settings)
     .create();
+}
+
+// ---- RECOMMENDED: run once to schedule two separate single-topic runs
+// per day (morning + afternoon), each getting its own full GitHub
+// Actions time budget instead of splitting one budget across two
+// increasingly-long, deeply-interactive lessons.
+function createTwiceDailyTriggers() {
+  // Clear ALL existing triggers on this project first (both the old
+  // single daily one and any previous twice-daily ones) to avoid
+  // duplicates or the old two-topic version running alongside this.
+  ScriptApp.getProjectTriggers().forEach(t => ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('generateAndDispatchOneTopic')
+    .timeBased()
+    .everyDays(1)
+    .atHour(8) // morning run, 8am in the script's timezone
+    .create();
+
+  ScriptApp.newTrigger('generateAndDispatchOneTopic')
+    .timeBased()
+    .everyDays(1)
+    .atHour(14) // afternoon run, 2pm in the script's timezone
+    .create();
+
+  Logger.log('Scheduled two daily triggers: 8am and 2pm, one topic each.');
 }

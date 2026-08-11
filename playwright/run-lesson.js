@@ -165,8 +165,9 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
   }
 }
 
-async function engageWithFollowUps(page, record, topicLabel, maxRounds = 20, maxMs = 300000) {
+async function engageWithFollowUps(page, record, topicLabel, maxRounds = 30, maxMs = 1200000) {
   const start = Date.now();
+  let pathCompleteStreak = 0;
   for (let round = 1; round <= maxRounds; round++) {
     if (Date.now() - start > maxMs) {
       record(`Round ${round}: hit the ${Math.round(maxMs / 60000)}-minute time budget for this topic — moving on.`);
@@ -176,12 +177,20 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 20, max
     await waitForPageToStabilize(page);
 
     // If Oboe shows a structured step-by-step path and it's no longer on a
-    // "current step," treat the lesson as genuinely finished rather than
-    // continuing to poke at it.
+    // "current step," treat the lesson as genuinely finished. Require this
+    // to hold on two consecutive rounds before trusting it — a single
+    // reading could be a brief render gap between the path widget
+    // finishing one step and starting the next, not real completion.
     const pathComplete = await isStructuredPathComplete(page);
     if (pathComplete === true) {
-      record(`Round ${round}: structured lesson path shows complete (no more "CURRENT STEP") — stopping here.`);
-      break;
+      pathCompleteStreak++;
+      if (pathCompleteStreak >= 2) {
+        record(`Round ${round}: structured lesson path confirmed complete on 2 consecutive checks — stopping here.`);
+        break;
+      }
+      record(`Round ${round}: path looks complete, confirming once more before trusting it...`);
+    } else {
+      pathCompleteStreak = 0;
     }
 
     const chips = await findSuggestionChips(page);
@@ -345,7 +354,10 @@ async function run() {
   } catch (err) {
     record('ERROR: ' + err.message);
     await screenshot(page, '99-error-state');
-    if (summaries.length > 0) await postSummaryToWebhook(summaries, record); // send partial summary if any topics finished
+    // Deliberately NOT sending a "summary" email here even if some topics
+    // completed before the failure — the workflow's separate failure-alert
+    // step is the single source of truth for "this run failed," so you get
+    // exactly one email, not a confusing success-looking one plus a failure one.
     fs.writeFileSync(path.join(OUT_DIR, 'run-log.txt'), log.join('\n'));
     await browser.close();
     process.exit(1);
