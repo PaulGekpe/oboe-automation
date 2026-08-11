@@ -62,14 +62,30 @@ async function screenshot(page, name) {
   await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true });
 }
 
-async function waitForOboeToFinishThinking(page, maxMs = 90000) {
+// ROBUST wait: instead of matching specific loading phrases (Oboe cycles
+// through many — "Thinking...", "Reading X...", "Mapping out...",
+// "Aligning...", "Developing...", "Building..." — and a text-match only
+// catches the ones we've happened to see), this watches whether the
+// page's visible text is still changing at all. Once it's identical on
+// two checks in a row, Oboe has genuinely finished streaming/generating,
+// regardless of what any loading label said. This is what actually fixes
+// the "bot acts while still generating" bug.
+async function waitForPageToStabilize(page, { intervalMs = 2000, stableChecksNeeded = 2, maxMs = 120000 } = {}) {
   const start = Date.now();
+  let lastText = null;
+  let stableCount = 0;
   while (Date.now() - start < maxMs) {
-    const thinking = await page.locator('text=Thinking...').first().isVisible().catch(() => false);
-    if (!thinking) return true;
-    await page.waitForTimeout(1500);
+    const currentText = await page.locator('body').innerText().catch(() => null);
+    if (currentText !== null && currentText === lastText) {
+      stableCount++;
+      if (stableCount >= stableChecksNeeded) return true;
+    } else {
+      stableCount = 0;
+      lastText = currentText;
+    }
+    await page.waitForTimeout(intervalMs);
   }
-  return false;
+  return false; // gave up — caller should proceed cautiously
 }
 
 async function findSuggestionChips(page) {
@@ -157,7 +173,7 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 20, max
       break;
     }
 
-    await waitForOboeToFinishThinking(page);
+    await waitForPageToStabilize(page);
 
     // If Oboe shows a structured step-by-step path and it's no longer on a
     // "current step," treat the lesson as genuinely finished rather than
@@ -196,7 +212,7 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 20, max
     }
 
     await page.waitForTimeout(1500);
-    await waitForOboeToFinishThinking(page);
+    await waitForPageToStabilize(page);
     await screenshot(page, `${topicLabel}-engagement-round-${round}`);
   }
 }
@@ -224,7 +240,7 @@ async function runOneTopic(page, record, topicIndex, topicObj) {
 
   record(`[${label}] Waiting for the lesson to build...`);
   await page.waitForTimeout(2000);
-  await waitForOboeToFinishThinking(page);
+  await waitForPageToStabilize(page);
   await screenshot(page, `${label}-03-built`);
 
   record(`[${label}] Engaging with follow-up questions...`);
@@ -240,7 +256,7 @@ async function runOneTopic(page, record, topicIndex, topicObj) {
     await askBox.fill('/studyguide');
     await page.keyboard.press('Enter');
     await page.waitForTimeout(3000);
-    await waitForOboeToFinishThinking(page);
+    await waitForPageToStabilize(page);
     studyGuideText = await getLastMessageText(page);
     await screenshot(page, `${label}-99-studyguide`);
   } else {
