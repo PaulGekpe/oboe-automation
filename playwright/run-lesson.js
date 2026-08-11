@@ -38,21 +38,15 @@ if (!STORAGE_STATE_B64 || TOPICS.length === 0) {
   process.exit(1);
 }
 
-// Edit these if Oboe's real markup differs. name="prompt" and the send
-// button's aria-label were confirmed from a real captured page.
+// All confirmed from real captured Oboe markup — no more guessing here.
 const SELECTORS = {
-  promptBox: 'textarea[name="prompt"]',
+  promptBox: 'textarea[name="prompt"]', // confirmed on both fresh home screen and mid-lesson
   sendButton: 'button[type="submit"][aria-label="Send message"]',
-  // Multiple-choice / suggested-reply chips. `.followUpRow` was confirmed
-  // from a real captured lettered quiz (A/B/C/D style). Broadened with a
-  // partial-class match too, since Oboe appears to have at least one other
-  // suggestion style (plain "Continue to..." / "Tell me more..." rows) that
-  // may use different markup — unconfirmed, may need a real capture to nail
-  // down precisely.
-  suggestedReplyChip: '.followUpRow, [class*="followUpRow"], [class*="suggestionRow"], [class*="nextStepRow"]',
-  // The step-by-step "Your path" checklist shown for structured lessons.
+  // Confirmed: plain suggestions AND lettered A/B/C/D quizzes both use this
+  // same followUpRow class, inside a shared suggested-replies container.
+  suggestedReplyChip: '[data-test-id="suggested-replies"] .followUpRow',
   pathContainer: 'text=Your path',
-  currentStepLabel: 'text=CURRENT STEP'
+  currentStepLabel: 'text=Current Step' // confirmed exact text (CSS renders it as uppercase, but the DOM text is mixed-case)
 };
 
 const GENERIC_ENGAGED_REPLIES = [
@@ -286,6 +280,7 @@ async function run() {
   const browser = await chromium.launch();
   const context = await browser.newContext({ storageState: storageStatePath });
   const page = await context.newPage();
+  page.setDefaultTimeout(45000); // more headroom than Playwright's 30s default, for a slower CI runner
 
   const log = [];
   const record = msg => { console.log(msg); log.push(`${new Date().toISOString()} ${msg}`); };
@@ -296,6 +291,23 @@ async function run() {
     await page.goto('https://oboe.com/', { waitUntil: 'networkidle' });
     await screenshot(page, '00-home');
 
+    // The real crash we hit wasn't a wrong selector — it was the page
+    // taking longer to render on GitHub's servers than expected. Wait
+    // explicitly and generously, with one reload-and-retry if needed,
+    // instead of assuming networkidle alone means the app has mounted.
+    let promptReady = await page.locator(SELECTORS.promptBox).first()
+      .waitFor({ state: 'visible', timeout: 45000 }).then(() => true).catch(() => false);
+    if (!promptReady) {
+      record('Prompt box not visible after 45s — reloading once and trying again.');
+      await page.reload({ waitUntil: 'networkidle' });
+      await screenshot(page, '00b-home-after-reload');
+      promptReady = await page.locator(SELECTORS.promptBox).first()
+        .waitFor({ state: 'visible', timeout: 45000 }).then(() => true).catch(() => false);
+    }
+    if (!promptReady) {
+      throw new Error('Prompt box never appeared even after a reload — see 00-home.png / 00b-home-after-reload.png to check what the page actually showed.');
+    }
+
     const loggedOut = await page.locator('text=Log in').first().isVisible().catch(() => false);
     if (loggedOut) {
       throw new Error('Session appears expired — "Log in" is visible. Re-run save-session.js and update the GitHub secret.');
@@ -305,6 +317,7 @@ async function run() {
       // Start a fresh chat for each topic after the first (click the "+" new-chat control).
       if (i > 0) {
         await page.goto('https://oboe.com/', { waitUntil: 'networkidle' });
+        await page.locator(SELECTORS.promptBox).first().waitFor({ state: 'visible', timeout: 45000 }).catch(() => {});
         await page.waitForTimeout(1000);
       }
       const result = await runOneTopic(page, record, i, TOPICS[i]);
