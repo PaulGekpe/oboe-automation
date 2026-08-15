@@ -197,26 +197,39 @@ function dispatchToGitHub(token, repo, topics) {
   }
 }
 
-// ---- topic history, stored in a Sheet, so we don't repeat ourselves ----
+// ---- topic history, stored in Script Properties (persists across every
+// run, triggered or manual — unlike SpreadsheetApp.getActiveSpreadsheet(),
+// which returns null on a time-trigger run and silently created a BRAND
+// NEW blank spreadsheet every single time, wiping the history each run.
+// That was the actual bug behind topics repeating. ----
+const TOPIC_LOG_KEY = 'TOPIC_LOG';
+const TOPIC_LOG_MAX_ENTRIES = 200; // safety cap so this never approaches the property size limit
+
 function getAllLoggedTopics() {
-  const sheet = getLogSheet();
-  const data = sheet.getDataRange().getValues();
-  return data.slice(1).map(row => row[1]).filter(String);
+  const raw = PropertiesService.getScriptProperties().getProperty(TOPIC_LOG_KEY);
+  return raw ? JSON.parse(raw) : [];
 }
 
 function saveTopicToLog(topic) {
-  const sheet = getLogSheet();
-  sheet.appendRow([new Date(), topic]);
+  const props = PropertiesService.getScriptProperties();
+  const log = getAllLoggedTopics();
+  log.push(topic);
+  while (log.length > TOPIC_LOG_MAX_ENTRIES) log.shift(); // keep it bounded, oldest entries drop off
+  props.setProperty(TOPIC_LOG_KEY, JSON.stringify(log));
 }
 
-function getLogSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet() || SpreadsheetApp.create('Oboe Daily Topics');
-  let sheet = ss.getSheetByName('Log');
-  if (!sheet) {
-    sheet = ss.insertSheet('Log');
-    sheet.appendRow(['Date', 'Topic']);
+// ---- ONE-TIME REPAIR: run this manually once after deploying this fix.
+// Marks "effective communication skills" as already covered (it genuinely
+// was, twice) so the next run advances to "negotiation strategies"
+// instead of repeating a 3rd time. Safe to run even if TOPIC_LOG is
+// already empty or already contains it.
+function repairTopicLogAfterSpreadsheetBug() {
+  const log = getAllLoggedTopics();
+  if (log.indexOf('effective communication skills') === -1) {
+    log.push('effective communication skills');
+    PropertiesService.getScriptProperties().setProperty(TOPIC_LOG_KEY, JSON.stringify(log));
   }
-  return sheet;
+  Logger.log('Topic log now: ' + JSON.stringify(log));
 }
 
 // ---- receives pings from GitHub Actions: either a failure alert or a

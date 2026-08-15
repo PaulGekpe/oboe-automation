@@ -165,7 +165,7 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
   }
 }
 
-async function engageWithFollowUps(page, record, topicLabel, maxRounds = 30, maxMs = 1200000) {
+async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, maxMs = 1500000) {
   const start = Date.now();
   let pathCompleteStreak = 0;
   for (let round = 1; round <= maxRounds; round++) {
