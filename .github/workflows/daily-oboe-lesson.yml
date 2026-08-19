@@ -13,20 +13,26 @@ on:
 jobs:
   run-lesson:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
+        timeout-minutes: 3
 
       - uses: actions/setup-node@v4
+        timeout-minutes: 3
         with:
           node-version: '22'
 
       - name: Install dependencies
         working-directory: ./playwright
+        timeout-minutes: 3
         run: npm ci
 
       - name: Install Playwright browsers
         working-directory: ./playwright
+        timeout-minutes: 6 # apt-get occasionally hangs on a slow mirror with zero output — fail fast instead of burning the whole job's budget
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: npx playwright install --with-deps chromium
 
       - name: Run Oboe lesson bot
@@ -48,7 +54,7 @@ jobs:
           retention-days: 14
 
       - name: Alert on failure
-        if: failure()
+        if: failure() || cancelled()
         env:
           WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
