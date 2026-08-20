@@ -119,13 +119,19 @@ async function getLastMessageText(page) {
 }
 
 // If Oboe shows a structured "Your path" checklist, this returns whether
-// it looks complete (path exists, but no "CURRENT STEP" marker left).
+// it looks complete (path exists, but no step is marked "Current Step").
 // Returns null if no path is present at all (topic isn't using that format).
+// Scoped tightly to the real role="list" / role="listitem" structure
+// confirmed from captured Oboe markup, rather than two independent
+// page-wide text searches — those could false-positive if "Your path" or
+// "Current Step" ever appear in unrelated context, causing the lesson to
+// look "done" after just one round.
 async function isStructuredPathComplete(page) {
-  const hasPath = await page.locator(SELECTORS.pathContainer).first().isVisible().catch(() => false);
+  const pathList = page.locator('[role="list"]').first();
+  const hasPath = await pathList.isVisible().catch(() => false);
   if (!hasPath) return null;
-  const hasCurrentStep = await page.locator(SELECTORS.currentStepLabel).first().isVisible().catch(() => false);
-  return !hasCurrentStep;
+  const currentStepCount = await page.locator('[role="listitem"]:has-text("Current Step")').count().catch(() => 0);
+  return currentStepCount === 0;
 }
 
 // Calls Claude Haiku to either pick the best chip index or write a genuine
@@ -149,7 +155,8 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
         model: 'claude-haiku-4-5-20251001',
         max_tokens: 150,
         messages: [{ role: 'user', content: prompt }]
-      })
+      }),
+      signal: AbortSignal.timeout(20000) // hard cap: never let a hung network call silently eat the job's time budget
     });
     const data = await response.json();
     const text = data?.content?.[0]?.text?.trim();
@@ -184,7 +191,7 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
     const pathComplete = await isStructuredPathComplete(page);
     if (pathComplete === true) {
       pathCompleteStreak++;
-      if (pathCompleteStreak >= 2) {
+      if (pathCompleteStreak >= 3) {
         record(`Round ${round}: structured lesson path confirmed complete on 2 consecutive checks — stopping here.`);
         break;
       }
@@ -289,7 +296,8 @@ async function postSummaryToWebhook(summaries, record) {
         type: 'summary',
         date: new Date().toISOString().slice(0, 10),
         topics: summaries
-      })
+      }),
+      signal: AbortSignal.timeout(15000)
     });
     record('Posted daily summary to webhook.');
   } catch (e) {
