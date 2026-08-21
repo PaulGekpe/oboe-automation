@@ -195,7 +195,7 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
     if (pathComplete === true) {
       pathCompleteStreak++;
       if (pathCompleteStreak >= 3) {
-        record(`Round ${round}: structured lesson path confirmed complete on 2 consecutive checks — stopping here.`);
+        record(`Round ${round}: structured lesson path confirmed complete on 3 consecutive checks — stopping here.`);
         break;
       }
       record(`Round ${round}: path looks complete, confirming once more before trusting it...`);
