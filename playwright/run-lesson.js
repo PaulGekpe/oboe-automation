@@ -127,10 +127,13 @@ async function getLastMessageText(page) {
 // "Current Step" ever appear in unrelated context, causing the lesson to
 // look "done" after just one round.
 async function isStructuredPathComplete(page) {
-  const pathList = page.locator('[role="list"]').first();
-  const hasPath = await pathList.isVisible().catch(() => false);
+  // Scoped tightly to the specific "Your path" card (a <section> in
+  // Oboe's real markup), not any role="list" anywhere on the page —
+  // an unrelated list elsewhere could otherwise false-positive.
+  const pathSection = page.locator('section').filter({ hasText: 'Your path' }).first();
+  const hasPath = await pathSection.isVisible().catch(() => false);
   if (!hasPath) return null;
-  const currentStepCount = await page.locator('[role="listitem"]:has-text("Current Step")').count().catch(() => 0);
+  const currentStepCount = await pathSection.locator('[role="listitem"]:has-text("Current Step")').count().catch(() => 0);
   return currentStepCount === 0;
 }
 
