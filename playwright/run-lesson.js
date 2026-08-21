@@ -118,25 +118,6 @@ async function getLastMessageText(page) {
   }
 }
 
-// If Oboe shows a structured "Your path" checklist, this returns whether
-// it looks complete (path exists, but no step is marked "Current Step").
-// Returns null if no path is present at all (topic isn't using that format).
-// Scoped tightly to the real role="list" / role="listitem" structure
-// confirmed from captured Oboe markup, rather than two independent
-// page-wide text searches — those could false-positive if "Your path" or
-// "Current Step" ever appear in unrelated context, causing the lesson to
-// look "done" after just one round.
-async function isStructuredPathComplete(page) {
-  // Scoped tightly to the specific "Your path" card (a <section> in
-  // Oboe's real markup), not any role="list" anywhere on the page —
-  // an unrelated list elsewhere could otherwise false-positive.
-  const pathSection = page.locator('section').filter({ hasText: 'Your path' }).first();
-  const hasPath = await pathSection.isVisible().catch(() => false);
-  if (!hasPath) return null;
-  const currentStepCount = await pathSection.locator('[role="listitem"]:has-text("Current Step")').count().catch(() => 0);
-  return currentStepCount === 0;
-}
-
 // Calls Claude Haiku to either pick the best chip index or write a genuine
 // short reply. Returns { chipIndex } or { replyText }. Falls back to null
 // (caller should use free/random behavior) if no API key or on any error.
@@ -177,7 +158,6 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
 
 async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, maxMs = 1500000) {
   const start = Date.now();
-  let pathCompleteStreak = 0;
   for (let round = 1; round <= maxRounds; round++) {
     if (Date.now() - start > maxMs) {
       record(`Round ${round}: hit the ${Math.round(maxMs / 60000)}-minute time budget for this topic — moving on.`);
@@ -186,22 +166,14 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
 
     await waitForPageToStabilize(page);
 
-    // If Oboe shows a structured step-by-step path and it's no longer on a
-    // "current step," treat the lesson as genuinely finished. Require this
-    // to hold on two consecutive rounds before trusting it — a single
-    // reading could be a brief render gap between the path widget
-    // finishing one step and starting the next, not real completion.
-    const pathComplete = await isStructuredPathComplete(page);
-    if (pathComplete === true) {
-      pathCompleteStreak++;
-      if (pathCompleteStreak >= 3) {
-        record(`Round ${round}: structured lesson path confirmed complete on 3 consecutive checks — stopping here.`);
-        break;
-      }
-      record(`Round ${round}: path looks complete, confirming once more before trusting it...`);
-    } else {
-      pathCompleteStreak = 0;
-    }
+    // NOTE: we previously tried detecting Oboe's "Your path" checklist to
+    // spot genuine early completion. After three separate attempts each
+    // false-positiving in a different way (different topics seem to
+    // render/clear the "current step" marker inconsistently between
+    // steps), we're dropping that check entirely. The bot now runs real
+    // rounds until it either hits the time budget above, or genuinely
+    // runs out of things to do (no chips AND no input box — see below),
+    // which doesn't require guessing at Oboe's internal step-labeling.
 
     const chips = await findSuggestionChips(page);
     const lastMessage = await getLastMessageText(page);
