@@ -220,9 +220,15 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
       const chosenText = chipTexts[chosenIndex];
       record(`Round ${round}: ${source} — "${chosenText}"`);
 
-      const clickResult = await chips[chosenIndex].click().then(() => 'ok').catch(() => 'failed');
-      if (clickResult === 'failed') {
-        record(`Round ${round}: chip click failed, skipping.`);
+      const clickResult = await chips[chosenIndex].click({ timeout: 10000 }).then(() => ({ ok: true })).catch(err => ({ ok: false, err }));
+      if (!clickResult.ok) {
+        // Playwright's own error usually names exactly what's blocking the
+        // click (e.g. "<div role='dialog' ...> intercepts pointer events")
+        // — log that instead of throwing it away, so we can actually see
+        // what's stuck without guessing.
+        const errorSnippet = (clickResult.err?.message || 'unknown error').split('\n').slice(0, 4).join(' | ').slice(0, 300);
+        record(`Round ${round}: chip click failed — ${errorSnippet}`);
+        await screenshot(page, `${topicLabel}-round-${round}-click-failed`).catch(() => {});
         if (chosenText === lastFailedChipText) {
           consecutiveSameFailures++;
         } else {
