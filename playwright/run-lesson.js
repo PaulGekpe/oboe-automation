@@ -156,8 +156,39 @@ async function askClaudeForAnswer(lastMessageText, chipTexts) {
   }
 }
 
+// Any unexpected modal (session prompt, feedback popup, usage notice —
+// we don't know exactly what Oboe shows here, and don't need to) blocks
+// every click behind it. Try to clear it generically: Escape first, then
+// a close/dismiss button if one exists, then clicking the dialog's own
+// backdrop as a last resort.
+async function closeAnyOpenDialog(page, record) {
+  const dialog = page.locator('[role="dialog"]').first();
+  const isOpen = await dialog.isVisible().catch(() => false);
+  if (!isOpen) return false;
+
+  record('Detected an open dialog blocking interaction — attempting to close it.');
+  await page.keyboard.press('Escape').catch(() => {});
+  await page.waitForTimeout(500);
+  if (!(await dialog.isVisible().catch(() => false))) return true;
+
+  const closeButton = dialog.locator('button[aria-label="Close" i], button:has-text("Close"), button:has-text("Dismiss"), button:has-text("Got it"), button:has-text("Skip")').first();
+  if (await closeButton.isVisible().catch(() => false)) {
+    await closeButton.click().catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  if (!(await dialog.isVisible().catch(() => false))) return true;
+
+  // Last resort: click the backdrop outside the dialog itself.
+  await page.mouse.click(5, 5).catch(() => {});
+  await page.waitForTimeout(500);
+  return !(await dialog.isVisible().catch(() => false));
+}
+
 async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, maxMs = 1500000) {
   const start = Date.now();
+  let lastFailedChipText = null;
+  let consecutiveSameFailures = 0;
+
   for (let round = 1; round <= maxRounds; round++) {
     if (Date.now() - start > maxMs) {
       record(`Round ${round}: hit the ${Math.round(maxMs / 60000)}-minute time budget for this topic — moving on.`);
@@ -165,6 +196,7 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
     }
 
     await waitForPageToStabilize(page);
+    await closeAnyOpenDialog(page, record);
 
     // NOTE: we previously tried detecting Oboe's "Your path" checklist to
     // spot genuine early completion. After three separate attempts each
@@ -185,8 +217,28 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
       const aiChoice = await askClaudeForAnswer(lastMessage, chipTexts);
       const chosenIndex = aiChoice?.chipIndex ?? Math.floor(Math.random() * chips.length);
       const source = aiChoice ? 'AI-selected' : 'randomly picked (no AI / AI unavailable)';
-      record(`Round ${round}: ${source} — "${chipTexts[chosenIndex]}"`);
-      await chips[chosenIndex].click().catch(() => record(`Round ${round}: chip click failed, skipping.`));
+      const chosenText = chipTexts[chosenIndex];
+      record(`Round ${round}: ${source} — "${chosenText}"`);
+
+      const clickResult = await chips[chosenIndex].click().then(() => 'ok').catch(() => 'failed');
+      if (clickResult === 'failed') {
+        record(`Round ${round}: chip click failed, skipping.`);
+        if (chosenText === lastFailedChipText) {
+          consecutiveSameFailures++;
+        } else {
+          lastFailedChipText = chosenText;
+          consecutiveSameFailures = 1;
+        }
+        // Stuck: same click failing repeatedly (usually a blocked dialog
+        // we couldn't clear) — stop burning rounds and time on it.
+        if (consecutiveSameFailures >= 3) {
+          record(`Round ${round}: same click has now failed ${consecutiveSameFailures} times in a row — likely something is blocking interaction (e.g. an unclosable dialog). Stopping engagement for this topic rather than looping uselessly.`);
+          break;
+        }
+      } else {
+        lastFailedChipText = null;
+        consecutiveSameFailures = 0;
+      }
     } else {
       const askBox = page.locator(SELECTORS.promptBox).first();
       if (!(await askBox.isVisible().catch(() => false))) {
@@ -200,6 +252,8 @@ async function engageWithFollowUps(page, record, topicLabel, maxRounds = 60, max
       await askBox.click();
       await askBox.fill(reply);
       await page.keyboard.press('Enter');
+      lastFailedChipText = null;
+      consecutiveSameFailures = 0;
     }
 
     await page.waitForTimeout(1500);
@@ -240,18 +294,28 @@ async function runOneTopic(page, record, topicIndex, topicObj) {
   const finalMessage = await getLastMessageText(page);
 
   record(`[${label}] Requesting a study guide artifact...`);
-  const askBox = page.locator(SELECTORS.promptBox).first();
+  await closeAnyOpenDialog(page, record);
   let studyGuideText = '';
-  if (await askBox.isVisible().catch(() => false)) {
-    await askBox.click();
-    await askBox.fill('/studyguide');
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(3000);
-    await waitForPageToStabilize(page);
-    studyGuideText = await getLastMessageText(page);
-    await screenshot(page, `${label}-99-studyguide`);
-  } else {
-    record(`[${label}] Ask box not found — skipping study guide step.`);
+  try {
+    const askBox = page.locator(SELECTORS.promptBox).first();
+    if (await askBox.isVisible().catch(() => false)) {
+      await askBox.click();
+      await askBox.fill('/studyguide');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(3000);
+      await waitForPageToStabilize(page);
+      studyGuideText = await getLastMessageText(page);
+      await screenshot(page, `${label}-99-studyguide`);
+    } else {
+      record(`[${label}] Ask box not found — skipping study guide step.`);
+    }
+  } catch (err) {
+    // The real lesson content (rounds of genuine engagement) already
+    // happened above and is worth keeping — don't let a failure in this
+    // bonus step (e.g. a blocked dialog) wipe out an otherwise-successful
+    // topic and fail the whole run.
+    record(`[${label}] Study guide step failed, continuing anyway: ${err.message}`);
+    await screenshot(page, `${label}-99-studyguide-failed`).catch(() => {});
   }
 
   return { topic, finalMessage, studyGuideText };
