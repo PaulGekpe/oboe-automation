@@ -62,6 +62,19 @@ async function screenshot(page, name) {
   await page.screenshot({ path: path.join(OUT_DIR, `${name}.png`), fullPage: true });
 }
 
+// Checks two independent signals instead of one — a real login prompt has
+// BOTH "Log in" and "Sign up for free" visible, which is much harder to
+// false-negative on than checking a single string (which apparently
+// missed a real logged-out state in one run — see round 34's dialog,
+// which had the same wording).
+async function assertLoggedIn(page) {
+  const hasLogIn = await page.locator('text=Log in').first().isVisible().catch(() => false);
+  const hasSignUp = await page.locator('text=Sign up for free').first().isVisible().catch(() => false);
+  if (hasLogIn || hasSignUp) {
+    throw new Error(`Session appears expired — logged-out UI is visible (Log in: ${hasLogIn}, Sign up: ${hasSignUp}). Re-run save-session.js and update the OBOE_STORAGE_STATE_B64 secret.`);
+  }
+}
+
 // ROBUST wait: instead of matching specific loading phrases (Oboe cycles
 // through many — "Thinking...", "Reading X...", "Mapping out...",
 // "Aligning...", "Developing...", "Building..." — and a text-match only
@@ -165,6 +178,18 @@ async function closeAnyOpenDialog(page, record) {
   const dialog = page.locator('[role="dialog"]').first();
   const isOpen = await dialog.isVisible().catch(() => false);
   if (!isOpen) return false;
+
+  const dialogText = await dialog.innerText().catch(() => '');
+
+  // If this looks like a session-expired / please-log-in prompt, dismissing
+  // it and continuing is pointless — the account isn't authenticated
+  // anymore, so nothing that follows will actually save. Fail fast with a
+  // clear message instead of silently burning rounds and API cost on a
+  // conversation that vanishes. (This is what likely happened in a run
+  // that went 60 rounds deep and never showed up in chat history.)
+  if (/log\s*in|sign\s*in|session (has |’s )?expired|please authenticate|re-?authenticate/i.test(dialogText)) {
+    throw new Error(`Session appears to have expired mid-run — dialog text: "${dialogText.slice(0, 200)}". Re-run save-session.js and update the OBOE_STORAGE_STATE_B64 secret.`);
+  }
 
   record('Detected an open dialog blocking interaction — attempting to close it.');
   await page.keyboard.press('Escape').catch(() => {});
@@ -316,10 +341,11 @@ async function runOneTopic(page, record, topicIndex, topicObj) {
       record(`[${label}] Ask box not found — skipping study guide step.`);
     }
   } catch (err) {
-    // The real lesson content (rounds of genuine engagement) already
-    // happened above and is worth keeping — don't let a failure in this
-    // bonus step (e.g. a blocked dialog) wipe out an otherwise-successful
-    // topic and fail the whole run.
+    // A dead session should still stop everything loudly — every
+    // remaining topic in this run would fail the same way. Only treat
+    // OTHER failures here (a genuinely minor issue in this bonus step) as
+    // non-fatal, keeping the real lesson content already earned above.
+    if (err.message.includes('Session appears to have expired')) throw err;
     record(`[${label}] Study guide step failed, continuing anyway: ${err.message}`);
     await screenshot(page, `${label}-99-studyguide-failed`).catch(() => {});
   }
@@ -386,10 +412,7 @@ async function run() {
       throw new Error('Prompt box never appeared even after a reload — see 00-home.png / 00b-home-after-reload.png to check what the page actually showed.');
     }
 
-    const loggedOut = await page.locator('text=Log in').first().isVisible().catch(() => false);
-    if (loggedOut) {
-      throw new Error('Session appears expired — "Log in" is visible. Re-run save-session.js and update the GitHub secret.');
-    }
+    await assertLoggedIn(page);
 
     for (let i = 0; i < TOPICS.length; i++) {
       // Start a fresh chat for each topic after the first (click the "+" new-chat control).
@@ -397,6 +420,7 @@ async function run() {
         await page.goto('https://oboe.com/', { waitUntil: 'networkidle' });
         await page.locator(SELECTORS.promptBox).first().waitFor({ state: 'visible', timeout: 45000 }).catch(() => {});
         await page.waitForTimeout(1000);
+        await assertLoggedIn(page);
       }
       const result = await runOneTopic(page, record, i, TOPICS[i]);
       summaries.push(result);
